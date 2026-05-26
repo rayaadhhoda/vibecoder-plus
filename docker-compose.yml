@@ -1,0 +1,54 @@
+services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  bot:
+    build: ./bot
+    restart: always
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./shared:/app/shared
+
+  orchestrator:
+    build: ./orchestrator
+    restart: always
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./shared:/app/shared
+      - worktrees:/worktrees
+
+  worker:
+    build: ./worker
+    restart: always
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    deploy:
+      replicas: 2
+    volumes:
+      - ./shared:/app/shared
+      - worktrees:/worktrees
+      - go_cache:/root/go
+      - go_build_cache:/root/.cache/go-build
+    shm_size: '2gb'
+
+volumes:
+  redis_data:
+  worktrees:
+  go_cache:
+  go_build_cache:
