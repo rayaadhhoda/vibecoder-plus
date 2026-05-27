@@ -11,7 +11,8 @@ class TaskType(str, Enum):
     UI_CHECK = "ui_check"  # visual UI validation via Gemini
     DEPLOY = "deploy"      # trigger a deployment
     PR = "pr"              # open / merge / review a PR
-    STATUS = "status"      # report current state
+    STATUS = "status"      # report current state (one-shot GitHub lookup)
+    CHAT = "chat"          # persistent conversational session with DeepSeek
 
 
 class TaskStatus(str, Enum):

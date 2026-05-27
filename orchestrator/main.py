@@ -245,12 +245,45 @@ def _handle_status(task: Task) -> None:
         _send(task.chat_id, f"❌ Couldn't fetch status: {e}")
 
 
+def _handle_chat(task: Task) -> None:
+    """Direct multi-turn conversation with DeepSeek, with full history."""
+    history = q.get_conversation(task.user_id)
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful assistant and senior software engineer. "
+                "The user may ask you anything — code questions, architecture, debugging, "
+                "or general topics. Be concise and conversational. "
+                "Format for Telegram Markdown: use `backticks` for code/commands, "
+                "*bold* for headings, and keep responses tight."
+            ),
+        },
+        *history,
+        {"role": "user", "content": task.prompt},
+    ]
+
+    try:
+        content = _deepseek_chat(messages, temperature=0.7, timeout=45)
+        q.append_conversation(task.user_id, "user", task.prompt)
+        q.append_conversation(task.user_id, "assistant", content)
+        _send(task.chat_id, content)
+    except Exception as e:
+        log.error(f"Chat failed for {task.id}: {e}")
+        _send(task.chat_id, f"❌ DeepSeek error: {e}")
+
+
 def process(task: Task) -> None:
     log.info(f"Orchestrating {task.id} type={task.type}")
 
     # Check for cancel before doing any work
     if q.is_cancelled(task.id):
         _send(task.chat_id, f"🚫 Task `[{task.id}]` was cancelled before it started.")
+        return
+
+    if task.type == TaskType.CHAT:
+        _handle_chat(task)
         return
 
     if task.type == TaskType.STATUS:
