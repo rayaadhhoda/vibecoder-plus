@@ -12,12 +12,18 @@ Flow:
 import logging
 import os
 import subprocess
+import time
 import sys
 import textwrap
 
 import httpx
 
+from shared.queue import Queue
+from shared.retry import retry
+
 log = logging.getLogger(__name__)
+
+q = Queue(os.environ["REDIS_URL"])
 
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
@@ -63,10 +69,14 @@ def _ensure_base_repo() -> None:
     log.info(f"Base repo cloned to {REPO_PATH}")
 
     # Configure git identity for commits
-    git_email = os.environ.get("DEVBOT_GIT_EMAIL", "devbot@example.com")
-    git_name = os.environ.get("DEVBOT_GIT_NAME", "DevBot")
-    subprocess.run(["git", "-C", REPO_PATH, "config", "user.email", git_email], capture_output=True)
-    subprocess.run(["git", "-C", REPO_PATH, "config", "user.name", git_name], capture_output=True)
+    subprocess.run(["git", "-C", REPO_PATH, "config", "user.email", "${DEVBOT_GIT_EMAIL:-devbot@example.com}"], capture_output=True)
+    subprocess.run(["git", "-C", REPO_PATH, "config", "user.name", "DevBot"], capture_output=True)
+
+
+def _check_cancelled(task_id: str) -> None:
+    """Raise if the task has been cancelled."""
+    if q.is_cancelled(task_id):
+        raise RuntimeError(f"Task {task_id} was cancelled")
 
 
 def implement(task_id: str, plan: dict, prompt: str) -> dict:
@@ -100,10 +110,8 @@ def implement(task_id: str, plan: dict, prompt: str) -> dict:
         ["git", "-C", REPO_PATH, "worktree", "add", "-b", branch, worktree_path, "origin/main"],
         "create worktree",
     )
-    git_email = os.environ.get("DEVBOT_GIT_EMAIL", "devbot@example.com")
-    git_name = os.environ.get("DEVBOT_GIT_NAME", "DevBot")
-    subprocess.run(["git", "-C", worktree_path, "config", "user.email", git_email], capture_output=True)
-    subprocess.run(["git", "-C", worktree_path, "config", "user.name", git_name], capture_output=True)
+    subprocess.run(["git", "-C", worktree_path, "config", "user.email", "${DEVBOT_GIT_EMAIL:-devbot@example.com}"], capture_output=True)
+    subprocess.run(["git", "-C", worktree_path, "config", "user.name", "DevBot"], capture_output=True)
     # Wire token into push URL so git push doesn't prompt for auth
     github_token = os.environ.get("GITHUB_TOKEN", "")
     subprocess.run(
@@ -114,12 +122,15 @@ def implement(task_id: str, plan: dict, prompt: str) -> dict:
 
     try:
         # 2. Read relevant files for context
+        _check_cancelled(task_id)
         file_contexts = _read_files(worktree_path, files_to_read)
 
         # 3. Ask DeepSeek to implement
+        _check_cancelled(task_id)
         changes = _ask_deepseek(prompt, steps, file_contexts)
 
         # 4. Apply changes
+        _check_cancelled(task_id)
         for change in changes:
             fpath = os.path.join(worktree_path, change["path"])
             os.makedirs(os.path.dirname(fpath), exist_ok=True)
@@ -128,11 +139,13 @@ def implement(task_id: str, plan: dict, prompt: str) -> dict:
             log.info(f"Wrote {change['path']}")
 
         # 5. Run tests
+        _check_cancelled(task_id)
         log.info("Running tests...")
         test_output = _run_tests(worktree_path, test_cmd)
         log.info(f"Tests done: {test_output[-100:]!r}")
 
         # 6. Commit + push
+        _check_cancelled(task_id)
         log.info("Committing...")
         _run(["git", "-C", worktree_path, "add", "-A"], "git add")
         _run(
@@ -164,21 +177,17 @@ def implement(task_id: str, plan: dict, prompt: str) -> dict:
         return {"success": False, "pr_url": None, "test_output": "", "summary": str(e)}
 
     finally:
-        # Always clean up the worktree
+        # Always clean up the worktree and cancel key
         subprocess.run(
             ["git", "-C", REPO_PATH, "worktree", "remove", "--force", worktree_path],
             capture_output=True,
         )
+        q.clear_cancel(task_id)
 
 
-def _ask_deepseek(prompt: str, steps: list[str], file_contexts: str) -> list[dict]:
-    import re
-    user_msg = (
-        f"Task: {prompt}\n\n"
-        f"Steps to implement:\n" + "\n".join(f"- {s}" for s in steps) + "\n\n"
-        f"Current file contents:\n{file_contexts}"
-    )
-
+@retry(max_attempts=3, base_delay=2.0)
+def _deepseek_call(user_msg: str) -> str:
+    """Single DeepSeek call — wrapped with retry."""
     response = httpx.post(
         "https://api.deepseek.com/chat/completions",
         headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
@@ -194,7 +203,18 @@ def _ask_deepseek(prompt: str, steps: list[str], file_contexts: str) -> list[dic
         timeout=180,
     )
     response.raise_for_status()
-    content = response.json()["choices"][0]["message"]["content"]
+    return response.json()["choices"][0]["message"]["content"]
+
+
+def _ask_deepseek(prompt: str, steps: list[str], file_contexts: str) -> list[dict]:
+    import re
+    user_msg = (
+        f"Task: {prompt}\n\n"
+        f"Steps to implement:\n" + "\n".join(f"- {s}" for s in steps) + "\n\n"
+        f"Current file contents:\n{file_contexts}"
+    )
+
+    content = _deepseek_call(user_msg)
 
     # Parse delimiter format: <<<FILE: path>>> ... <<<END>>> (or next <<<FILE:)
     changes = []

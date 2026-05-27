@@ -3,6 +3,7 @@ Worker — executes tasks dispatched by the orchestrator.
 """
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import re
@@ -45,6 +46,11 @@ GH_ENV = {**os.environ, "GH_TOKEN": GITHUB_TOKEN}
 
 
 def handle(task: Task) -> str:
+    # ── Cancel check ─────────────────────────────────────────────────────────
+    if q.is_cancelled(task.id):
+        q.clear_cancel(task.id)
+        return f"🚫 Task `[{task.id}]` was cancelled."
+
     # ── Code implementation ──────────────────────────────────────────────────
     if task.type == TaskType.CODE:
         plan = task.context.get("plan", {})
@@ -128,8 +134,10 @@ def _handle_deploy(task: Task) -> str:
             ["git", "-C", coding.REPO_PATH, "worktree", "add", "-b", branch, worktree, "origin/main"],
             "create worktree",
         )
-        subprocess.run(["git", "-C", worktree, "config", "user.email", "devbot@governorai.ai"], capture_output=True)
-        subprocess.run(["git", "-C", worktree, "config", "user.name", "DevBot"], capture_output=True)
+        git_email = os.environ.get("DEVBOT_GIT_EMAIL", "devbot@example.com")
+        git_name = os.environ.get("DEVBOT_GIT_NAME", "DevBot")
+        subprocess.run(["git", "-C", worktree, "config", "user.email", git_email], capture_output=True)
+        subprocess.run(["git", "-C", worktree, "config", "user.name", git_name], capture_output=True)
         subprocess.run(
             ["git", "-C", worktree, "remote", "set-url", "origin",
              f"https://{GITHUB_TOKEN}@github.com/{coding.GITHUB_REPO}.git"],
@@ -266,9 +274,14 @@ def main() -> None:
         _send(task.chat_id, f"⚙️ Working on it...")
 
         try:
-            result_msg = handle(task)
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                fut = pool.submit(handle, task)
+                result_msg = fut.result(timeout=600)  # 10-minute per-task timeout
             q.update_session(task.user_id, {"last_result": result_msg[:500]})
             _send(task.chat_id, result_msg)
+        except concurrent.futures.TimeoutError:
+            log.error(f"Task {task.id} timed out after 10 minutes")
+            _send(task.chat_id, f"⏱ Task `[{task.id}]` timed out after 10 min")
         except Exception as e:
             log.error(f"Worker failed on {task.id}: {e}")
             _send(task.chat_id, f"❌ Failed: {e}")

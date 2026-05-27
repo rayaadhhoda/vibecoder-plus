@@ -1,3 +1,5 @@
+version: "3.9"
+
 services:
   redis:
     image: redis:7-alpine
@@ -29,7 +31,7 @@ services:
         condition: service_healthy
     volumes:
       - ./shared:/app/shared
-      - worktrees:/worktrees
+      - worktrees:/worktrees   # git worktrees live here
 
   worker:
     build: ./worker
@@ -39,13 +41,13 @@ services:
       redis:
         condition: service_healthy
     deploy:
-      replicas: 2
+      replicas: 2              # run two workers so multiple tasks can execute in parallel
     volumes:
       - ./shared:/app/shared
       - worktrees:/worktrees
-      - go_cache:/root/go
-      - go_build_cache:/root/.cache/go-build
-    shm_size: '2gb'
+      - go_cache:/root/go                    # Go module cache — persists across restarts
+      - go_build_cache:/root/.cache/go-build # Go build cache — keeps test runs fast
+    shm_size: '2gb'            # Playwright needs extra shared memory for Chromium
 
 volumes:
   redis_data:

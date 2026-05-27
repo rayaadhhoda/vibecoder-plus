@@ -17,6 +17,7 @@ import httpx
 
 from shared.models import Task, TaskType, TaskStatus
 from shared.queue import Queue
+from shared.retry import retry
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -158,37 +159,51 @@ def _get_repo_context(prompt: str = "") -> dict:
     return ctx
 
 
+@retry(max_attempts=3, base_delay=2.0)
+def _deepseek_chat(messages: list, temperature: float = 0.2, timeout: int = 60, response_format: dict | None = None) -> dict:
+    """Call DeepSeek API with retry."""
+    body: dict = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+    }
+    if response_format:
+        body["response_format"] = response_format
+    response = httpx.post(
+        "https://api.deepseek.com/chat/completions",
+        headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
+        json=body,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+
 def plan_task(task: Task) -> dict:
     session = q.get_session(task.user_id)
     recent_context = session.get("last_result", "")
     tree = _get_repo_tree()
 
-    response = httpx.post(
-        "https://api.deepseek.com/chat/completions",
-        headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-        json={
-            "model": DEEPSEEK_MODEL,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": PLANNING_SYSTEM_PROMPT.format(repo=GITHUB_REPO),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Repository file tree:\n{tree}\n\n"
-                        f"Recent session context: {recent_context}\n\n"
-                        f"Task: {task.prompt}"
-                    ),
-                },
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": 0.2,
-        },
+    content = _deepseek_chat(
+        messages=[
+            {
+                "role": "system",
+                "content": PLANNING_SYSTEM_PROMPT.format(repo=GITHUB_REPO),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Repository file tree:\n{tree}\n\n"
+                    f"Recent session context: {recent_context}\n\n"
+                    f"Task: {task.prompt}"
+                ),
+            },
+        ],
+        temperature=0.2,
         timeout=60,
+        response_format={"type": "json_object"},
     )
-    response.raise_for_status()
-    return json.loads(response.json()["choices"][0]["message"]["content"])
+    return json.loads(content)
 
 
 def _handle_status(task: Task) -> None:
@@ -216,21 +231,15 @@ def _handle_status(task: Task) -> None:
     )
 
     try:
-        response = httpx.post(
-            "https://api.deepseek.com/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}"},
-            json={
-                "model": DEEPSEEK_MODEL,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": task.prompt},
-                ],
-                "temperature": 0.2,
-            },
+        content = _deepseek_chat(
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": task.prompt},
+            ],
+            temperature=0.2,
             timeout=30,
         )
-        response.raise_for_status()
-        _send(task.chat_id, response.json()["choices"][0]["message"]["content"])
+        _send(task.chat_id, content)
     except Exception as e:
         log.error(f"Status query failed: {e}")
         _send(task.chat_id, f"❌ Couldn't fetch status: {e}")
@@ -238,6 +247,11 @@ def _handle_status(task: Task) -> None:
 
 def process(task: Task) -> None:
     log.info(f"Orchestrating {task.id} type={task.type}")
+
+    # Check for cancel before doing any work
+    if q.is_cancelled(task.id):
+        _send(task.chat_id, f"🚫 Task `[{task.id}]` was cancelled before it started.")
+        return
 
     if task.type == TaskType.STATUS:
         _handle_status(task)
