@@ -8,9 +8,11 @@ SESSION_PREFIX = "devbot:session:"
 CANCEL_PREFIX = "devbot:cancel:"
 CONV_PREFIX = "devbot:conv:"       # per-user DeepSeek conversation history
 CHATMODE_PREFIX = "devbot:chat:"   # per-user chat mode flag
+PENDING_PREFIX = "devbot:pending:" # per-user pending task awaiting user input
 
 MAX_CONV_HISTORY = 40   # keep last 40 turns (20 exchanges)
 CONV_TTL = 86400        # conversation history expires after 24 hours of inactivity
+PENDING_TTL = 3600      # pending task expires after 1 hour if ignored
 
 
 class Queue:
@@ -94,3 +96,17 @@ class Queue:
 
     def clear_conversation(self, user_id: int) -> None:
         self.r.delete(f"{CONV_PREFIX}{user_id}")
+
+    # ── Pending task (plan approval / clarification / retry) ─────────────────
+
+    def get_pending(self, user_id: int) -> "dict | None":
+        raw = self.r.get(f"{PENDING_PREFIX}{user_id}")
+        return json.loads(raw) if raw else None
+
+    def set_pending(self, user_id: int, state: str, task: "Task", **extra) -> None:
+        """Store a task that is waiting for user input before proceeding."""
+        payload = {"state": state, "task": task.to_dict(), **extra}
+        self.r.setex(f"{PENDING_PREFIX}{user_id}", PENDING_TTL, json.dumps(payload))
+
+    def clear_pending(self, user_id: int) -> None:
+        self.r.delete(f"{PENDING_PREFIX}{user_id}")

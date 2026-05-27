@@ -39,6 +39,14 @@ Given a user request and the repository file tree, produce a concise JSON execut
 
 Use the file tree to identify the exact files that need changing — do not guess paths that aren't listed.
 
+If the request is vague, references something you cannot find in the file tree, or could be
+interpreted multiple ways, set "clarification_needed" to a single focused question. Otherwise null.
+
+Set "confidence" based on how certain you are of the plan:
+- "high": you can see exactly which files to change and the approach is clear
+- "medium": you have a reasonable plan but some uncertainty remains
+- "low": the request is ambiguous or spans many unknown files
+
 Output ONLY valid JSON with this shape:
 {{
   "summary": "one-line summary of what will happen",
@@ -49,7 +57,9 @@ Output ONLY valid JSON with this shape:
   ],
   "files_likely_touched": ["exact/path/from/tree.go", "frontend/src/exact/File.tsx"],
   "test_command": "go test ./internal/policy/... ./pkg/types/... 2>&1 | tail -40",
-  "needs_playwright": false
+  "needs_playwright": false,
+  "confidence": "high",
+  "clarification_needed": null
 }}
 """
 
@@ -274,12 +284,90 @@ def _handle_chat(task: Task) -> None:
         _send(task.chat_id, f"❌ DeepSeek error: {e}")
 
 
+_POSITIVE = {"yes", "ok", "looks good", "lgtm", "go", "go ahead", "proceed",
+             "do it", "ship it", "yep", "yeah", "sure", "sounds good", "correct",
+             "perfect", "great", "y", "👍", "✅"}
+
+
+def _is_positive(text: str) -> bool:
+    t = text.lower().strip().rstrip(".")
+    return t in _POSITIVE or any(t.startswith(w) for w in ("yes", "ok ", "yep", "yeah", "sure"))
+
+
+def _is_cancel(text: str) -> bool:
+    t = text.lower().strip()
+    return any(w in t for w in ("cancel", "abort", "stop", "nevermind", "never mind", "no thanks", "forget it"))
+
+
+def _show_plan_and_wait(task: Task, plan: dict) -> None:
+    """Send the plan to the user and pause for approval."""
+    files = ", ".join(f"`{f}`" for f in plan.get("files_likely_touched", [])[:6])
+    steps = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan.get("steps", [])))
+    confidence = plan.get("confidence", "high")
+    confidence_note = " _(low confidence — double-check this plan)_" if confidence == "low" else ""
+
+    msg = (
+        f"📋 *Plan*{confidence_note}\n"
+        f"{plan['summary']}\n\n"
+        f"{steps}\n\n"
+        f"*Files:* {files or '(TBD)'}\n\n"
+        f"Reply `yes` to proceed, give feedback to adjust, or `cancel` to abort."
+    )
+    _send(task.chat_id, msg)
+    q.set_pending(task.user_id, "awaiting_approval", task)
+
+
+def _handle_feedback(task: Task) -> None:
+    """Route a user reply to a pending task: re-plan, proceed, or cancel."""
+    pending = task.context["pending"]
+    state = pending["state"]
+    original_task = Task.from_dict(pending["task"])
+    q.clear_pending(task.user_id)
+
+    if _is_cancel(task.prompt):
+        _send(task.chat_id, "🚫 Cancelled.")
+        return
+
+    # User approved a plan → dispatch to worker
+    if state == "awaiting_approval" and _is_positive(task.prompt):
+        _send(task.chat_id, "⚙️ On it...")
+        original_task.status = TaskStatus.QUEUED
+        q.push(original_task)
+        q.update_session(task.user_id, {"last_task_id": original_task.id})
+        return
+
+    # User gave feedback / clarification / retry guidance → re-plan with context
+    failure_context = pending.get("failure_context", "")
+    augmented_prompt = original_task.prompt
+    if failure_context:
+        augmented_prompt += f"\n\n[Previous attempt failed: {failure_context}]"
+    augmented_prompt += f"\n\n[User says: {task.prompt}]"
+    original_task.prompt = augmented_prompt
+
+    try:
+        _send(task.chat_id, "🗺 Replanning...")
+        plan = plan_task(original_task)
+        original_task.context["plan"] = plan
+        clarification = plan.get("clarification_needed")
+        if clarification:
+            _send(task.chat_id, f"❓ {clarification}")
+            q.set_pending(task.user_id, "awaiting_clarification", original_task)
+        else:
+            _show_plan_and_wait(original_task, plan)
+    except Exception as e:
+        log.error(f"Replan failed: {e}")
+        _send(task.chat_id, f"❌ Replanning failed: {e}")
+
+
 def process(task: Task) -> None:
     log.info(f"Orchestrating {task.id} type={task.type}")
 
-    # Check for cancel before doing any work
     if q.is_cancelled(task.id):
         _send(task.chat_id, f"🚫 Task `[{task.id}]` was cancelled before it started.")
+        return
+
+    if task.type == TaskType.FEEDBACK:
+        _handle_feedback(task)
         return
 
     if task.type == TaskType.CHAT:
@@ -295,16 +383,26 @@ def process(task: Task) -> None:
             _send(task.chat_id, f"🗺 Planning `[{task.id}]`...")
             plan = plan_task(task)
             task.context["plan"] = plan
-            log.info(f"Plan for {task.id}: {plan['summary']}")
-            files = ", ".join(plan["files_likely_touched"][:5])
-            _send(task.chat_id, f"📋 Plan: {plan['summary']}\nFiles: {files}")
+            log.info(f"Plan for {task.id}: {plan.get('summary')}")
+
+            # Ask for clarification if the plan is uncertain
+            clarification = plan.get("clarification_needed")
+            if clarification:
+                _send(task.chat_id, f"❓ {clarification}")
+                q.set_pending(task.user_id, "awaiting_clarification", task)
+                return
+
+            # Show plan and wait for approval before touching any code
+            _show_plan_and_wait(task, plan)
+            return
         except Exception as e:
             log.error(f"Planning failed: {e}")
             _send(task.chat_id, f"❌ Planning failed: {e}")
             return
 
+    # Non-CODE tasks (TEST, DEPLOY, PR, UI_CHECK) go straight to the worker
     task.status = TaskStatus.QUEUED
-    q.push(task)  # → WORKER_QUEUE
+    q.push(task)
     q.update_session(task.user_id, {"last_task_id": task.id, "last_task_type": task.type.value})
 
 

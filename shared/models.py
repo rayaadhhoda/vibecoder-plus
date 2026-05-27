@@ -13,6 +13,7 @@ class TaskType(str, Enum):
     PR = "pr"              # open / merge / review a PR
     STATUS = "status"      # report current state (one-shot GitHub lookup)
     CHAT = "chat"          # persistent conversational session with DeepSeek
+    FEEDBACK = "feedback"  # user reply to a pending plan / clarification / retry
 
 
 class TaskStatus(str, Enum):
@@ -20,6 +21,9 @@ class TaskStatus(str, Enum):
     IN_PROGRESS = "in_progress"
     DONE = "done"
     FAILED = "failed"
+    AWAITING_CLARIFICATION = "awaiting_clarification"  # bot asked a question
+    AWAITING_APPROVAL = "awaiting_approval"            # bot showed plan, needs go-ahead
+    AWAITING_RETRY = "awaiting_retry"                  # worker failed, needs guidance
 
 
 @dataclass

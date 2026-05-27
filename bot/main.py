@@ -132,6 +132,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await ctx.bot.send_chat_action(chat_id=chat_id, action="typing")
         return
 
+    # Check for a pending task before classifying — user may be replying to a
+    # plan approval request, a clarification question, or a retry prompt.
+    pending = q.get_pending(user_id)
+    if pending:
+        task = Task(
+            user_id=user_id,
+            chat_id=chat_id,
+            prompt=text,
+            type=TaskType.FEEDBACK,
+            context={"pending": pending},
+        )
+        q.push_orch(task)
+        return
+
     task = Task(
         user_id=user_id,
         chat_id=chat_id,

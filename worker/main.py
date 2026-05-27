@@ -59,13 +59,26 @@ def handle(task: Task) -> str:
             files = ", ".join(result["files_changed"])
             snippet = result["test_output"][-1000:] if result["test_output"] else ""
             return (
-                f"Done [{task.id}]\n"
+                f"✅ *Done* `[{task.id}]`\n"
                 f"{result['summary']}\n\n"
                 f"PR: {result['pr_url']}\n"
                 f"Files: {files}\n\n"
-                f"Tests:\n{snippet}"
+                f"Tests:\n```\n{snippet}\n```"
             )
-        return f"Failed [{task.id}]\n{result['summary']}"
+
+        # Failure: store the task as pending-retry so the user can guide another attempt
+        failure_context = result["summary"]
+        test_snippet = (result.get("test_output") or "")[-600:].strip()
+        q.set_pending(
+            task.user_id, "awaiting_retry", task,
+            failure_context=f"{failure_context}\n{test_snippet}",
+        )
+        return (
+            f"❌ *Failed* `[{task.id}]`\n\n"
+            f"*What went wrong:* {failure_context}\n\n"
+            + (f"```\n{test_snippet}\n```\n\n" if test_snippet else "")
+            + "Tell me what to try differently and I'll replan, or say `cancel`."
+        )
 
     # ── Test runner ──────────────────────────────────────────────────────────
     elif task.type == TaskType.TEST:
